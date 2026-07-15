@@ -1,0 +1,55 @@
+description: "TDS P1 - Telegram bot data-analyst agent eval (grades from data/ already collected by collect.py, no Telegram calls)"
+
+providers:
+  - id: 'exec: python3 read_collected.py maternal_mortality_state'
+    label: maternal_mortality_state
+  - id: 'exec: python3 read_collected.py flow_rate_forecast'
+    label: flow_rate_forecast
+
+defaultTest:
+  options:
+    transform: JSON.parse(output)
+
+tests:
+  - description: "Which state has highest maternal mortality (MOSPI)"
+    providers: [maternal_mortality_state]
+    assert:
+      - type: is-json
+        value:
+          type: object
+          required: [state]
+          properties:
+            state: { type: string }
+      - type: python
+        value: |
+          if output["_status"] != "answered":
+            return False
+          return output["state"].strip().lower() == "REPLACE_ME".lower()
+
+  - description: "Forecast flow rate for randomized per-student inputs"
+    providers: [flow_rate_forecast]
+    assert:
+      - type: is-json
+        value:
+          type: object
+          required: [values]
+          properties:
+            values: { type: array, items: { type: number } }
+      - type: python
+        value: |
+          if output["_status"] != "answered":
+            return False
+          inputs = output["_vars"]["inputs"]
+          expected = [round(x * 1.02, 2) for x in inputs]
+          values = output["values"]
+          if len(values) != len(expected):
+            return False
+          for v, e in zip(values, expected):
+            if abs(v - e) / max(abs(e), 1e-9) * 100 > 5:
+              return False
+          return True
+
+# Adding a question: one more provider block above (pointing at the same
+# read_collected.py with a different question_id), one more `tests:` entry
+# here with its own `assert:` list (python for tolerance/exact, llm-rubric
+# for anything needing an LLM judge, is-json for schema). No code changes.

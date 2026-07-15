@@ -1,0 +1,20 @@
+[
+  {
+    "id": "maternal_mortality_state",
+    "timeout_seconds": 300,
+    "messages": [
+      "Which state has the highest maternal mortality rate based on MOSPI data? End your reply with: FINAL_ANSWER: {\"state\": \"<state name>\"}"
+    ]
+  },
+  {
+    "id": "flow_rate_forecast",
+    "timeout_seconds": 300,
+    "randomize": {
+      "inputs": "rng.sample(range(10, 500), 5)"
+    },
+    "messages": [
+      "Build a model to forecast flow rate based on this dataset: <link>. Reply OK once ready.",
+      "Now forecast flow rate for these inputs: {{inputs}}. End your reply with: FINAL_ANSWER: {\"values\": [<forecasted numbers, same order as inputs>]}"
+    ]
+  }
+]
