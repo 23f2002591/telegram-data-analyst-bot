@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Generate per-student inputs, the exact messages collect.py will send, and
-the private answer key - all BEFORE any Telegram contact, so you can
-preview/audit everything first. This is the ONLY place the answer formula
-runs; collect.py just sends, grading.py just compares.
+"""Generate per-student inputs and the private answer key - all BEFORE any
+Telegram contact. This is the ONLY place the answer formula runs; collect.py
+renders these vars into the question templates and sends, grading.py compares.
 
 Writes two files:
 
-    inputs.json (public):  { "<qid>": { "<email>": { "vars": {...}, "messages": [...] } } }
+    inputs.json (public):  { "<qid>": { "<email>": {<vars>} } }
     key.json  (private):   { "<qid>": { "<email>": <expected answer> } }
 
 `vars` are drawn deterministically from the student's email + question id, so
-re-running is stable. `messages` are those vars rendered into the question
-text - literally what the student receives. The expected answer is a static
-`expected` from questions.json, or `expected_code` evaluated over that
-student's vars (so per-student answers are computed once, here).
+re-running is stable and collect.py/grading.py see the same values. The
+expected answer is a static `expected` from questions.json, or `expected_code`
+evaluated over that student's vars (so per-student answers are computed here).
 
 Usage: python3 generate.py --students students.csv
 """
@@ -35,12 +33,6 @@ def generate_vars(question, email):
     rng = random.Random(int(hashlib.sha256(f"{email}:{question['id']}".encode()).hexdigest(), 16))
     return {name: eval(code, {"rng": rng, "math": math, "statistics": statistics})
             for name, code in recipe.items()}
-
-
-def render(text, vars_):
-    for name, value in vars_.items():
-        text = text.replace("{{" + name + "}}", json.dumps(value))
-    return text
 
 
 def compute_expected(question, vars_):
@@ -67,8 +59,7 @@ def main():
         inputs[q["id"]], key[q["id"]] = {}, {}
         for row in students:
             vars_ = generate_vars(q, row["email"])
-            inputs[q["id"]][row["email"]] = {"vars": vars_,
-                                             "messages": [render(t, vars_) for t in q["messages"]]}
+            inputs[q["id"]][row["email"]] = vars_
             key[q["id"]][row["email"]] = compute_expected(q, vars_)
 
     Path(args.out).write_text(json.dumps(inputs, indent=2))
