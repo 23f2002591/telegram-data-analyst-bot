@@ -39,12 +39,12 @@ async def main():
         await asyncio.sleep(2)
 
         if "maternal mortality" in lower:
-            await event.respond('Based on MOSPI data: FINAL_ANSWER: {"state": "Assam"}')
+            await event.respond(json.dumps({"state": "Assam"}))
         elif "forecast flow rate for these inputs" in lower:
             match = re.search(r"\[([^\]]+)\]", text)
             inputs = [float(x) for x in match.group(1).split(",")] if match else []
             forecast = [round(v * 1.02, 2) for v in inputs]
-            await event.respond(f'Here is my forecast: FINAL_ANSWER: {{"values": {json.dumps(forecast)}}}')
+            await event.respond(json.dumps({"values": forecast}))
         elif "build a model to forecast" in lower:
             await event.respond("Model built and ready.")
         else:
