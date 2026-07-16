@@ -22,13 +22,22 @@ answer key — never publish it.
 
 ```
 uv sync            # or: pip install -r requirements.txt
-python3 login.py   # run in a real terminal once; prints a session string
 ```
 
 Bots can't message bots, so the grader logs in as a Telegram **user account**.
-Copy `.env.example` to `.env` and set `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`
-(https://my.telegram.org) and `TELEGRAM_SESSION_STRING` (from `login.py`). Use
-a number dedicated to grading. Roster is a CSV: `email,github_url,telegram_bot_username`.
+Copy `.env.example` to `.env` and fill it in (each step is in its comments):
+
+- `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — https://my.telegram.org → *API
+  development tools* → create an app.
+- `TELEGRAM_SESSION_STRING` — run `python3 login.py` once in a real terminal
+  (asks for your phone + the login code Telegram texts you); paste what it prints.
+- `BOT_TOKEN` — only for the test bot below: message `@BotFather` → `/newbot`.
+
+Use a number dedicated to grading. Roster is a CSV:
+`email,github_url,telegram_bot_username`.
+
+To test the pipeline without real students, run `python3 test_bot/fake_student_bot.py`
+in its own terminal (needs `BOT_TOKEN`) and put its `@username` in a one-row roster.
 
 ## Run
 
