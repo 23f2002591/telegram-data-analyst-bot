@@ -13,11 +13,21 @@ Within a question, students are processed concurrently (bounded by
 --concurrency, throttled by --stagger-seconds between conversation starts)
 so wall-clock time isn't students x timeout - safer under Telegram's
 anti-spam heuristics because new first-contacts trickle in rather than
-burstinge.
+bursting.
 
-Fully resumable at any scale: an already-written
-data/<slug>/<question_id>.json means that (student, question) is done and
-is skipped on re-run, after any crash or FloodWait.
+Every attempt records one JSON file per (student, question) with a `status`:
+    ok       - got replies (grading decides correctness)
+    timeout  - message sent, no reply within timeout_seconds (student's bot)
+    bad_bot  - username unresolvable / not a bot (student's problem)
+    error    - our-side/unexpected failure (network, etc.), captured with a
+               reason and RE-ATTEMPTED on the next run
+timeout_seconds is the budget for the whole (possibly multi-turn) exchange.
+
+Resumable at any scale: a terminal outcome (ok/timeout/bad_bot) is skipped on
+re-run; only `error` files are retried. The run never stops for a per-student
+failure - it only pauses for Telegram rate limiting: FloodWait is retried in
+place with exponential backoff; a persistent PeerFlood, after backoff, stops
+the run for manual @SpamBot verification, after which you just re-run.
 
 Usage:
     python collect.py --students students.csv
@@ -30,28 +40,39 @@ import os
 import re
 import sys
 from pathlib import Path
+from string import Template
 
 from dotenv import load_dotenv
-load_dotenv()  
+load_dotenv()
 
 from telethon import TelegramClient
 from telethon.errors import (FloodWaitError, PeerFloodError,
                               UsernameInvalidError, UsernameNotOccupiedError)
 from telethon.sessions import StringSession
 
+# Rate-limit backoff knobs (seconds). FloodWait is retried in place; a
+# persistent PeerFlood pauses the whole run before stopping for @SpamBot.
+BACKOFF_BASE = 30
+FLOOD_RETRIES = 3
+FLOOD_MAX_WAIT = 600
+PEERFLOOD_RETRIES = 5
+PEERFLOOD_MAX_WAIT = 3600
+
+TERMINAL = {"ok", "timeout", "bad_bot"}  # recorded outcomes not retried on re-run
+
+
 def slugify(email):
     return re.sub(r"[^a-zA-Z0-9]+", "_", email.strip().lower()).strip("_")
 
 
 def render(text, vars_):
-    """Substitute {{name}} placeholders with this student's vars (as JSON
-    literals). A leftover {{...}} means a question/vars mismatch - fail loudly
-    here, before anything is sent to a bot."""
-    for name, value in vars_.items():
-        text = text.replace("{{" + name + "}}", json.dumps(value))
-    if "{{" in text:
-        raise SystemExit(f"unrendered placeholder in message: {text!r}")
-    return text
+    """Fill $name placeholders with this student's vars (as JSON literals).
+    substitute() raises KeyError if the text needs a var we didn't generate -
+    fail loudly here, before anything is sent to a bot."""
+    try:
+        return Template(text).substitute({k: json.dumps(v) for k, v in vars_.items()})
+    except KeyError as e:
+        raise SystemExit(f"message needs var {e} not generated for this student: {text!r}")
 
 
 def result_path(data_dir, email, question_id):
@@ -66,34 +87,52 @@ def write_result_atomic(path, result):
     tmp.rename(path)
 
 
-async def run_one(client, row, question, vars_, data_dir, sem):
-    email = row["email"]
-    out_path = result_path(data_dir, email, question["id"])
-    if out_path.exists():
-        return  # already resolved (answered/timeout/error) - skip on resume
-
-    messages = [render(t, vars_) for t in question["messages"]]  # raises before any send if a placeholder is unfilled
-    sent, replies, status = [], [], "ok"
-    async with sem:
+async def _converse(client, bot, messages, timeout, email, qid):
+    """Run the exchange and classify the outcome as (status, detail, sent,
+    replies). Every failure is captured except PeerFloodError, which is
+    account-level and re-raised to pause the whole run."""
+    for attempt in range(FLOOD_RETRIES):
+        sent, replies = [], []
         try:
-            async with client.conversation(row["telegram_bot_username"],
-                                           timeout=question.get("timeout_seconds", 300)) as conv:
+            async with client.conversation(bot, timeout=timeout) as conv:
                 for msg in messages:
                     await conv.send_message(msg)
                     sent.append(msg)
                     replies.append((await conv.get_response()).raw_text)
+            return "ok", None, sent, replies
         except asyncio.TimeoutError:
-            status = "timeout"  # keep partial transcript captured so far
+            return "timeout", "no reply within budget", sent, replies
         except (UsernameInvalidError, UsernameNotOccupiedError, ValueError) as e:
-            write_result_atomic(out_path, {"status": "error", "vars": vars_, "error": str(e)})
-            return
+            return "bad_bot", str(e), sent, replies
+        except PeerFloodError:
+            raise  # account-level rate limit -> handled by run_wave_resilient
         except FloodWaitError as e:
-            print(f"[{email}] {question['id']}: FloodWait {e.seconds}s, deferring to next run")
-            await asyncio.sleep(e.seconds + 1)
-            return  # leave unwritten so a re-run retries this one
-        # PeerFloodError propagates to run_question_wave, which aborts the run.
+            if e.seconds > FLOOD_MAX_WAIT:  # don't wedge a slot; retry on next run
+                return "error", f"FloodWait {e.seconds}s exceeds cap", sent, replies
+            wait = e.seconds + BACKOFF_BASE * 2 ** attempt
+            print(f"[{email}] {qid}: FloodWait {e.seconds}s, backing off {wait}s ({attempt + 1}/{FLOOD_RETRIES})")
+            await asyncio.sleep(wait)
+        except Exception as e:  # our-side/unexpected -> capture, retry on next run
+            return "error", f"{type(e).__name__}: {e}", sent, replies
+    return "error", "FloodWait retries exhausted", sent, replies
 
-    write_result_atomic(out_path, {"status": status, "vars": vars_, "sent": sent, "replies": replies})
+
+async def run_one(client, row, question, vars_, data_dir, sem):
+    email = row["email"]
+    out_path = result_path(data_dir, email, question["id"])
+    if out_path.exists() and json.loads(out_path.read_text()).get("status") in TERMINAL:
+        return  # terminal outcome recorded - skip; only "error" is retried
+
+    messages = [render(t, vars_) for t in question["messages"]]  # raises before any send if a placeholder is unfilled
+    async with sem:
+        status, detail, sent, replies = await _converse(
+            client, row["telegram_bot_username"], messages, question.get("timeout_seconds", 300),
+            email, question["id"])
+
+    result = {"status": status, "vars": vars_, "sent": sent, "replies": replies}
+    if detail:
+        result["detail"] = detail
+    write_result_atomic(out_path, result)
     print(f"[{email}] {question['id']}: {status} ({len(replies)} replies)")
 
 
@@ -111,10 +150,25 @@ async def run_question_wave(client, students, question, inputs_q, data_dir, conc
         except PeerFloodError:
             for t in tasks:
                 t.cancel()
-            print("FATAL: Telegram has flagged this account as spammy (PeerFloodError) - not a "
-                  "timed wait. Verify via @SpamBot in the Telegram app, then re-run this command; "
-                  "already-answered students are unaffected.")
-            sys.exit(2)
+            raise  # to run_wave_resilient, which backs off and retries the wave
+
+
+async def run_wave_resilient(client, students, question, inputs_q, data_dir, concurrency, stagger_seconds):
+    """Run a question wave, absorbing account-level PeerFlood rate limiting with
+    exponential backoff. Re-running the wave naturally resumes (done students
+    are skipped). Only a PeerFlood that persists past the retries stops the run."""
+    for attempt in range(PEERFLOOD_RETRIES):
+        try:
+            await run_question_wave(client, students, question, inputs_q,
+                                    data_dir, concurrency, stagger_seconds)
+            return
+        except PeerFloodError:
+            wait = min(BACKOFF_BASE * 2 ** attempt, PEERFLOOD_MAX_WAIT)
+            print(f"PeerFlood (account rate-limited). Backing off {wait}s, "
+                  f"attempt {attempt + 1}/{PEERFLOOD_RETRIES}...")
+            await asyncio.sleep(wait)
+    sys.exit("FATAL: still PeerFlood-limited after backoff. Verify the account via @SpamBot in "
+             "Telegram, then re-run - recorded students (and our-side 'error' retries) are handled correctly.")
 
 
 async def main_async(students, questions, inputs, data_dir, concurrency, stagger_seconds):
@@ -124,8 +178,8 @@ async def main_async(students, questions, inputs, data_dir, concurrency, stagger
     async with client:
         for question in questions:  # question-major: everyone finishes Q_n before Q_n+1 starts
             print(f"=== question '{question['id']}': {len(students)} students ===")
-            await run_question_wave(client, students, question, inputs[question["id"]],
-                                    data_dir, concurrency, stagger_seconds)
+            await run_wave_resilient(client, students, question, inputs[question["id"]],
+                                     data_dir, concurrency, stagger_seconds)
 
 
 def main():
@@ -142,6 +196,12 @@ def main():
     students = list(csv.DictReader(open(args.students, newline="")))
     questions = json.load(open(args.questions))
     inputs = json.load(open(args.inputs))
+
+    missing = [r["email"] for q in questions for r in students if r["email"] not in inputs.get(q["id"], {})]
+    if missing:
+        sys.exit(f"{len(missing)} (student, question) pairs missing from {args.inputs} - "
+                 f"run generate.py first. e.g. {missing[:3]}")
+
     asyncio.run(main_async(students, questions, inputs, args.data_dir, args.concurrency, args.stagger_seconds))
 
 
