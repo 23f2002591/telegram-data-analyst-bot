@@ -2,6 +2,7 @@
 *.session-journal
 .env
 data/
-answers.json
+inputs.json
+key.json
 __pycache__/
 *.pyc
