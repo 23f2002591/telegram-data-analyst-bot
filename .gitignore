@@ -1,8 +1,2 @@
-*.session
-*.session-journal
 .env
-data/
-inputs.json
-key.json
-__pycache__/
-*.pyc
+
